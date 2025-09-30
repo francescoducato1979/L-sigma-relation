@@ -1,0 +1,334 @@
+# CODIGO 5: (Parámetros cosmológicos y residuos)
+
+# -*- coding: utf-8 -*-
+# pip install numpy pandas scipy matplotlib
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from math import log10
+from scipy.integrate import quad
+from scipy.optimize import minimize
+import numpy.linalg as LA
+
+# =========================
+# 1) CONFIGURACIÓN INICIAL
+# =========================
+H0_BOUNDS = (30.0, 80.0)     # km s^-1 Mpc^-1
+OM_BOUNDS = (0.02, 0.40)     # Ωm (plano)
+
+H0_ANCLA = 73.1              # km s^-1 Mpc^-1
+OM_ANCLA = 0.302
+
+IN_EXCEL    = "mu_redshift.xlsx"        # Debe contener: redshift, mu, mu_err, log_sigma, log_sigma_err, estudio
+OUT_SUMMARY = "ajuste_summary.csv"
+OUT_TABLE   = "salida_residuos_y_delta_mu.xlsx"
+OUT_FIG_RES = "fig_residuos_ajuste.png"
+OUT_FIG_DMU = "fig_delta_mu_vs_z.png"
+OUT_FIG_SIG = "fig_delta_mu_vs_logsigma.png"
+
+# Colores solicitados
+ERRORBAR_GRAY = "#D0D0D0"   # gris claro para barras de error
+POINT_BLUE    = "blue"      # puntos para "este"
+AXIS_BLACK    = "black"     # ejes / títulos / ticks
+LINE_ORANGE   = "orange"    # recta de regresión (punteada) y puntos para "chavez"
+
+def style_axes_black(ax):
+    for spine in ax.spines.values():
+        spine.set_color(AXIS_BLACK)
+    ax.tick_params(colors=AXIS_BLACK)
+    ax.xaxis.label.set_color(AXIS_BLACK)
+    ax.yaxis.label.set_color(AXIS_BLACK)
+    ax.title.set_color(AXIS_BLACK)
+
+# ============================
+# 2) CARGA Y LIMPIEZA DE DATOS
+# ============================
+df = pd.read_excel(IN_EXCEL, sheet_name=0)
+
+rename = {}
+for c in df.columns:
+    cl = str(c).strip().lower()
+    if cl == "redshift": rename[c] = "redshift"
+    if cl == "mu":       rename[c] = "mu_obs"
+    if cl in ("mu_err","muerror","err_mu","sigma_mu"): rename[c] = "mu_err"
+    if cl in ("log_sigma","logsigma","log_sigma_ar","log10_sigma"): rename[c] = "log_sigma"
+    if cl in ("log_sigma_err","elog_sigma","elogsigma","log_sigma_error"): rename[c] = "log_sigma_err"
+    if cl == "codigo":   rename[c] = "codigo"
+    if cl == "estudio":  rename[c] = "estudio"
+df = df.rename(columns=rename)
+
+req = {"redshift","mu_obs","mu_err","log_sigma","log_sigma_err","estudio"}
+missing = req - set(df.columns)
+if missing:
+    raise ValueError(f"Faltan columnas en {IN_EXCEL}: {missing}")
+
+z          = df["redshift"].astype(float).to_numpy()
+mu_obs     = df["mu_obs"].astype(float).to_numpy()
+mu_err     = df["mu_err"].astype(float).to_numpy()
+log_sigma  = df["log_sigma"].astype(float).to_numpy()
+elog_sigma = df["log_sigma_err"].astype(float).to_numpy()
+estudio    = df["estudio"].astype(str).str.strip().str.lower().to_numpy()
+
+valid = (np.isfinite(z) & np.isfinite(mu_obs) & np.isfinite(mu_err) &
+         np.isfinite(log_sigma) & np.isfinite(elog_sigma) & (mu_err > 0) & (elog_sigma >= 0))
+if not np.all(valid):
+    print(f"Advertencia: {np.count_nonzero(~valid)} filas inválidas serán ignoradas en el ajuste.")
+z_fit, mu_obs_fit, mu_err_fit = z[valid], mu_obs[valid], mu_err[valid]
+
+# Paleta por punto según 'estudio'
+# - "este"  -> azul (POINT_BLUE)
+# - "chavez"-> naranja (LINE_ORANGE)
+# - otros   -> azul (por defecto)
+point_colors_all = np.where(estudio == "chavez", LINE_ORANGE, POINT_BLUE)
+
+# =======================================
+# 3) DEFINICIÓN DE D_L Y μ_th (ΛCDM plano)
+# =======================================
+c_km_s   = 299792.458
+MPC_TO_PC = 1.0e6
+
+def E_of_z(z, om):
+    return np.sqrt(om*(1.0+z)**3 + (1.0-om))
+
+def D_L_Mpc(z, H0, om, epsrel=1e-8):
+    if z <= 0:
+        return 0.0
+    I, _ = quad(lambda zp: 1.0/E_of_z(zp, om), 0.0, z, epsabs=0, epsrel=epsrel, limit=200)
+    return (1.0+z) * (c_km_s/H0) * I
+
+def mu_th(z, H0, om):
+    Dl_pc = D_L_Mpc(z, H0, om) * MPC_TO_PC
+    return 5.0*log10(Dl_pc) - 5.0
+
+# ================================
+# 4) AJUSTE: minimizar χ² (L-BFGS-B)
+# ================================
+def chi2(params):
+    H0, om = params
+    if not (H0_BOUNDS[0] <= H0 <= H0_BOUNDS[1] and OM_BOUNDS[0] <= om <= OM_BOUNDS[1]):
+        return 1e30
+    mu_model = np.array([mu_th(zi, H0, om) for zi in z_fit])
+    return np.sum(((mu_obs_fit - mu_model)/mu_err_fit)**2)
+
+x0 = np.array([(H0_BOUNDS[0]+H0_BOUNDS[1])/2.0,
+               (OM_BOUNDS[0]+OM_BOUNDS[1])/2.0])
+
+res = minimize(chi2, x0=x0, method="L-BFGS-B",
+               bounds=[H0_BOUNDS, OM_BOUNDS],
+               options=dict(maxiter=500, ftol=1e-10))
+
+H0_hat, OM_hat = res.x
+chi2_min = res.fun
+dof = z_fit.size - 2
+chi2_red = chi2_min/dof if dof>0 else np.nan
+
+# ===============================
+# 5) HESSIANA Y ERRORES (opcional)
+# ===============================
+def numerical_hessian(f, x, eps=1e-3):
+    x = np.array(x, dtype=float)
+    n = len(x)
+    H = np.zeros((n, n), dtype=float)
+    fx = f(x)
+    for i in range(n):
+        ei = np.zeros(n); ei[i] = 1.0
+        for j in range(i, n):
+            ej = np.zeros(n); ej[j] = 1.0
+            if i == j:
+                fpp = f(x + eps*ei); fmm = f(x - eps*ei)
+                H[i, i] = (fpp - 2.0*fx + fmm) / (eps**2)
+            else:
+                fpp = f(x + eps*ei + eps*ej)
+                fpm = f(x + eps*ei - eps*ej)
+                fmp = f(x - eps*ei + eps*ej)
+                fmm = f(x - eps*ei - eps*ej)
+                H[i, j] = (fpp - fpm - fmp + fmm) / (4.0*eps**2)
+                H[j, i] = H[i, j]
+    return H
+
+try:
+    H = numerical_hessian(chi2, np.array([H0_hat, OM_hat]), eps=1e-3)
+    cov = 2.0 * LA.inv(H)
+    errs = np.sqrt(np.diag(cov))
+    err_H0, err_OM = errs[0], errs[1]
+except LA.LinAlgError:
+    cov = np.full((2,2), np.nan)
+    err_H0 = err_OM = np.nan
+
+# ==========================
+# 6) RESIDUOS DEL AJUSTE
+# ==========================
+mu_model_fit_all = np.array([mu_th(zi, H0_hat, OM_hat) for zi in z])
+residuos     = mu_obs - mu_model_fit_all
+residuos_err = mu_err
+
+# =====================================
+# 7) μ TEÓRICO (ANCLA) y Δμ
+# =====================================
+mu_model_ancla = np.array([mu_th(zi, H0_ANCLA, OM_ANCLA) for zi in z])
+delta_mu     = mu_obs - mu_model_ancla
+delta_mu_err = mu_err
+
+# =====================================
+# FUNCIÓN AUXILIAR: ajuste lineal WLS
+# =====================================
+def wls_line_fit(x, y, yerr):
+    w = 1.0 / (yerr**2)
+    S  = np.sum(w)
+    Sx = np.sum(w*x)
+    Sy = np.sum(w*y)
+    Sxx= np.sum(w*x*x)
+    Sxy= np.sum(w*x*y)
+    Delta = S*Sxx - Sx*Sx
+    a = (Sxx*Sy - Sx*Sxy) / Delta
+    b = (S*Sxy - Sx*Sy)   / Delta
+    sigma_a = np.sqrt(Sxx / Delta)
+    sigma_b = np.sqrt(S   / Delta)
+    return a, b, sigma_a, sigma_b
+
+# =====================================
+# 8) TABLA DE SALIDA Y RESUMEN
+# =====================================
+tabla = df.copy()
+tabla["mu_th(ajuste)"] = mu_model_fit_all
+tabla["residuo"]       = residuos
+tabla["residuo_err"]   = residuos_err
+tabla["mu_th(ancla)"]  = mu_model_ancla
+tabla["delta_mu"]      = delta_mu
+tabla["delta_mu_err"]  = delta_mu_err
+tabla.to_excel(OUT_TABLE, index=False)
+
+summary = pd.DataFrame({
+    "param": ["H0_hat","Omega_m_hat","chi2_min","dof","chi2_red","err_H0","err_Omega_m"],
+    "value": [H0_hat, OM_hat, chi2_min, dof, chi2_red, err_H0, err_OM]
+})
+summary.to_csv(OUT_SUMMARY, index=False)
+
+# =====================================
+# 9) GRÁFICOS 
+# =====================================
+
+# --- 9.1 Residuos vs z ---
+mask_res = (np.isfinite(z) & np.isfinite(residuos) &
+            np.isfinite(residuos_err) & (residuos_err > 0))
+
+a_r, b_r, sa_r, sb_r = wls_line_fit(z[mask_res], residuos[mask_res], residuos_err[mask_res])
+z_line_r = np.linspace(np.min(z[mask_res]), np.max(z[mask_res]), 300)
+y_line_r = a_r + b_r * z_line_r
+
+fig, ax = plt.subplots()
+# Colores para los puntos usados en este gráfico (coinciden con el conjunto completo aquí)
+colors_res = point_colors_all
+for xi, yi, yerri, ci, ok in zip(z, residuos, residuos_err, colors_res, mask_res):
+    if not ok:
+        continue
+    ax.errorbar(
+        xi, yi, yerr=yerri,
+        fmt='o', ms=4, capsize=3,
+        color=ci, mfc=ci, mec=ci,
+        ecolor=ERRORBAR_GRAY
+    )
+ax.plot(z_line_r, y_line_r, color=LINE_ORANGE, linestyle=':', linewidth=2.0)
+ax.axhline(0, linestyle='--', color=AXIS_BLACK, linewidth=1.0)
+ax.set_xlabel("redshift z")
+ax.set_ylabel(r"$\Delta \mu = \mu_{\rm obs} - \mu_{\rm th}(\hat H_0,\hat \Omega_m)$")
+ax.set_title(f"Residuos del ajuste (χ²/dof={chi2_red:.2f})")
+eq_text0 = (r"$\Delta\mu = (%.1f \pm %.1f) + (%.1f \pm %.1f)\,z$"
+            % (a_r, sa_r, b_r, sb_r))
+ax.text(0.02, 0.02, eq_text0, transform=ax.transAxes, color=AXIS_BLACK)
+style_axes_black(ax)
+fig.tight_layout()
+fig.savefig(OUT_FIG_RES, dpi=140, bbox_inches="tight")
+plt.show()
+
+# --- 9.2 Δμ (ancla) vs z + recta (WLS en y) ---
+mask_dmu = (np.isfinite(z) & np.isfinite(delta_mu) &
+            np.isfinite(delta_mu_err) & (delta_mu_err > 0))
+
+a_z, b_z, sa_z, sb_z = wls_line_fit(z[mask_dmu], delta_mu[mask_dmu], delta_mu_err[mask_dmu])
+z_line = np.linspace(np.min(z[mask_dmu]), np.max(z[mask_dmu]), 300)
+y_line = a_z + b_z*z_line
+
+fig, ax = plt.subplots()
+colors_dmu = point_colors_all
+for xi, yi, yerri, ci, ok in zip(z, delta_mu, delta_mu_err, colors_dmu, mask_dmu):
+    if not ok:
+        continue
+    ax.errorbar(
+        xi, yi, yerr=yerri,
+        fmt='o', ms=4, capsize=3,
+        color=ci, mfc=ci, mec=ci,
+        ecolor=ERRORBAR_GRAY
+    )
+ax.plot(z_line, y_line, color=LINE_ORANGE, linestyle=':', linewidth=2.0)
+ax.axhline(0, linestyle='--', color=AXIS_BLACK, linewidth=1.0)
+ax.set_xlabel("redshift z")
+ax.set_ylabel(r"$\Delta \mu = \mu_{\rm obs} - \mu_{\rm th}(\mathrm{ancla})$")
+ax.set_title("Δμ vs z")
+eq_text = (r"$\Delta\mu = (%.1f \pm %.1f) + (%.1f \pm %.1f)\,z$"
+           % (a_z, sa_z, b_z, sb_z))
+ax.text(0.02, 0.02, eq_text, transform=ax.transAxes, color=AXIS_BLACK)
+style_axes_black(ax)
+fig.tight_layout()
+fig.savefig(OUT_FIG_DMU, dpi=140, bbox_inches="tight")
+plt.show()
+
+# --- 9.3 Δμ (ancla) vs log_sigma ---
+mask_xy = (np.isfinite(delta_mu) & np.isfinite(delta_mu_err) &
+           np.isfinite(log_sigma) & np.isfinite(elog_sigma))
+
+x   = log_sigma[mask_xy]
+y   = delta_mu[mask_xy]
+yerr= delta_mu_err[mask_xy]
+xerr= elog_sigma[mask_xy]
+colors_xy = point_colors_all[mask_xy]
+
+a_s, b_s, sa_s, sb_s = wls_line_fit(x, y, yerr)
+xx = np.linspace(x.min(), x.max(), 300)
+yy = a_s + b_s*xx
+
+fig, ax = plt.subplots()
+for xi, yi, xierr, yerri, ci in zip(x, y, xerr, yerr, colors_xy):
+    ax.errorbar(
+        xi, yi,
+        xerr=xierr, yerr=yerri,
+        fmt='o', ms=4, capsize=3,
+        color=ci, mfc=ci, mec=ci,
+        ecolor=ERRORBAR_GRAY
+    )
+ax.plot(xx, yy, color=LINE_ORANGE, linestyle=':', linewidth=2.0)
+ax.axhline(0, linestyle='--', color=AXIS_BLACK, linewidth=1.0)
+ax.set_xlabel(r"$\log_{10}\sigma$  (km s$^{-1}$)")
+ax.set_ylabel(r"$\Delta \mu = \mu_{\rm obs} - \mu_{\rm th}(\mathrm{ancla})$")
+ax.set_title(r"$\Delta\mu$ vs $\log_{10}\sigma$")
+eq_text2 = (r"$\Delta\mu = (%.1f \pm %.1f) + (%.1f \pm %.1f)\,\log_{10}\sigma$"
+            % (a_s, sa_s, b_s, sb_s))
+ax.text(0.02, 0.02, eq_text2, transform=ax.transAxes, color=AXIS_BLACK)
+style_axes_black(ax)
+fig.tight_layout()
+fig.savefig(OUT_FIG_SIG, dpi=140, bbox_inches="tight")
+plt.show()
+
+# Resumen por consola
+print("\n=== Ajuste cosmológico (χ²) ===")
+print(f"H0_hat       = {H0_hat:.3f}  km s^-1 Mpc^-1")
+print(f"Omega_m_hat  = {OM_hat:.5f}")
+print(f"chi2_min     = {chi2_min:.3f}")
+print(f"d.o.f.       = {dof}")
+print(f"chi2/d.o.f.  = {chi2_red:.3f}")
+print(f"err_H0       = {err_H0:.3f}  (si la hessiana es estable)")
+print(f"err_Omega_m  = {err_OM:.5f}  (si la hessiana es estable)")
+
+# Ecuaciones en consola
+print("\nEcuación Δμ vs z (WLS):")
+print(f"Δμ = ({a_z:.1f} ± {sa_z:.1f}) + ({b_z:.1f} ± {sb_z:.1f}) z")
+print("\nEcuación Δμ vs log10σ (WLS en y):")
+print(f"Δμ = ({a_s:.1f} ± {sa_s:.1f}) + ({b_s:.1f} ± {sb_s:.1f}) log10σ")
+
+print("\nSalidas:")
+print(" - Resumen:", OUT_SUMMARY)
+print(" - Tabla  :", OUT_TABLE)
+print(" - Fig residuos:", OUT_FIG_RES)
+print(" - Fig Δμ vs z:", OUT_FIG_DMU)
+print(" - Fig Δμ vs logσ:", OUT_FIG_SIG)

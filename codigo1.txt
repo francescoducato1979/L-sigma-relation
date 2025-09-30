@@ -1,0 +1,40 @@
+# CODIGO 1: (Selección de los espectros con redshift conocido)
+
+import os
+import shutil
+import pandas as pd
+
+# === CONFIGURACIÓN ===
+ruta_tabla = ' Ruta al archivo Excel/espectros_con_redshift.xlsx'
+carpeta_origen = 'Ruta a la carpeta de origen de los espectros'
+carpeta_destino = os.path.join(carpeta_origen, 'seleccion_zspec')
+os.makedirs(carpeta_destino, exist_ok=True)
+
+# === LEER Y FILTRAR LA TABLA ===
+df = pd.read_excel(ruta_tabla)
+
+# Seleccionar solo los IDs con z_Spec distinto de -1
+ids_validos = df[df['z_Spec'] != -1]['NIRSpec_ID'].astype(int)
+
+# Formatear los IDs a 8 dígitos con ceros a la izquierda
+ids_formateados = [str(id).zfill(8) for id in ids_validos]
+
+# === MOVER ARCHIVOS QUE COINCIDAN ===
+archivos_movidos = []
+
+for archivo in os.listdir(carpeta_origen):
+    if archivo.endswith('.fits'):
+        for id_str in ids_formateados:
+            if id_str in archivo:
+                origen = os.path.join(carpeta_origen, archivo)
+                destino = os.path.join(carpeta_destino, archivo)
+                shutil.move(origen, destino)
+                archivos_movidos.append(archivo)
+                break  # Salir del bucle si ya se movió
+
+# === RESUMEN FINAL ===
+print(f"✅ Se movieron {len(archivos_movidos)} archivos a: {carpeta_destino}")
+if archivos_movidos:
+    print("📄 Ejemplos:")
+    for archivo in archivos_movidos[:5]:
+        print(f"  - {archivo}")

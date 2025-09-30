@@ -1,0 +1,78 @@
+# CODIGO 3: (espectros completos en el marco de longitud de onda en reposo)
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from astropy.io import fits
+from astropy.table import Table
+
+def guardar_espectros_en_reposo_con_plot(csv_path, carpeta_entrada='espectros', carpeta_salida='espectros_reposo'):
+    # Crear carpeta si no existe
+    os.makedirs(carpeta_salida, exist_ok=True)
+
+    # Leer tabla de redshifts
+    df = pd.read_csv(csv_path)
+
+    for _, row in df.iterrows():
+        filename = row['filename']
+        z = row['redshift']
+        input_path = os.path.join(carpeta_entrada, filename)
+
+        if not os.path.exists(input_path):
+            print(f"⚠️ Archivo no encontrado: {input_path}")
+            continue
+
+        with fits.open(input_path) as hdul:
+            hdr = hdul[0].header
+            table = hdul[1].data
+
+            wl_obs = table['WAVELENGTH']
+            flux = table['FLUX']
+
+            # Verificar datos válidos
+            valid = np.isfinite(wl_obs) & np.isfinite(flux)
+            wl_obs = wl_obs[valid]
+            flux = flux[valid]
+
+            # Convertir a longitud de onda en reposo (Å)
+            wl_rest = wl_obs / (1 + z) * 10000
+
+            # === Guardar FITS en reposo ===
+            t = Table([wl_rest, flux], names=('WAVELENGTH_REST', 'FLUX'))
+            hdu_prim = fits.PrimaryHDU(header=hdr)
+            hdu_table = fits.BinTableHDU(data=t)
+
+            base = os.path.splitext(filename)[0]
+            salida_fits = os.path.join(carpeta_salida, base + '_rest.fits')
+            fits.HDUList([hdu_prim, hdu_table]).writeto(salida_fits, overwrite=True)
+
+            # === Graficar espectro ===
+            plt.figure(figsize=(10, 4))
+            plt.plot(wl_rest, flux, color='black', lw=0.7)
+            plt.xlabel("Longitud de onda en reposo [Å]")
+            plt.ylabel("F (10⁻¹⁹ erg/s/cm²/Å)")
+            plt.title(f"Espectro en reposo – {base}")
+            plt.grid(True)
+            
+            # Añadir líneas espectrales si dentro del rango
+            lineas = {
+                'Hβ': 4861.33,
+                '[O III] 4959': 4958.91,
+                '[O III] 5007': 5006.84,
+                'Hα': 6562.80
+            }
+            for nombre, centro in lineas.items():
+                if wl_rest.min() <= centro <= wl_rest.max():
+                    plt.axvline(centro, color='blue', linestyle='--', alpha=0.8)
+                    plt.text(centro + 2, max(flux) * 0.85, nombre, rotation=90, fontsize=8, color='red')
+            
+            plt.tight_layout()
+            salida_png = os.path.join(carpeta_salida, base + '_rest.png')
+            plt.savefig(salida_png, dpi=150)
+            plt.close()
+            
+            print(f"✅ Guardado: {salida_fits}  y  {salida_png}")
+
+# === Ejecutar ===
+guardar_espectros_en_reposo_con_plot('redshifts.csv')

@@ -1,0 +1,808 @@
+# CODIGO 2: (Código principal: ajuste gaussiano, luminosidad, sigma, …)
+
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from astropy.io import fits
+from astropy.modeling import models, fitting
+from astropy.cosmology import FlatLambdaCDM
+from scipy.interpolate import interp1d
+
+# =======================
+# 0) Constantes & config
+# =======================
+C_KMS = 299_792.458
+C_CMS = C_KMS * 1e5                   # cm/s
+JY_CGS = 1.0e-23                      # 1 Jy = 1e-23 erg s^-1 cm^-2 Hz^-1
+GAUSS_2SQRT2LN2 = 2.3548             # FWHM = 2.3548 * sigma
+AA_PER_UM = 1.0e4
+CM_PER_MPC = 3.085677581491367e24
+
+# Extinción (Gordon et al.)
+K_HALPHA = 2.36
+K_HBETA  = 3.61
+BALMER_TEORICO = 2.86
+
+# Sigma térmico y de estructura fine
+sigma_term=9.1                    # km/s
+sigma_fs=2.401                    # km/s
+
+# Cosmología
+H0 = 73.1
+OM0 = 0.302
+H0_ERR  = 0.0
+OM0_ERR = 0.0
+COSMO = FlatLambdaCDM(H0=H0, Om0=OM0)
+
+# Filtro de redshift
+Z_MIN = 4.90
+Z_MAX = 7.02
+
+# Líneas (reposo, Å) y colores
+LINES = {
+    "Hβ": 4861.33,
+    "[O III] 4959": 4958.91,
+    "[O III] 5007": 5006.84,
+    "Hα": 6562.80
+}
+LINE_COLORS = {
+    "Hβ": "tab:blue",
+    "[O III] 4959": "tab:green",
+    "[O III] 5007": "tab:orange",
+    "Hα": "tab:red"
+}
+
+# >>>>> Ventana de ajuste dinámica (media-ventana en km/s)
+VEL_HALF_WINDOW_KMS: float = 900.0   # puedes ajustar este valor (p.ej., 800–1200 km/s)
+
+# (Se deja el alias para compatibilidad; None => ventana dinámica)
+FIT_WINDOW_AA: float | None = None   # ahora None; poner un numero para no para usar Δv_half dinámico
+
+# Bandas laterales para fondo (en Å OBSERVADA) — solo para SNR
+BG_MARGIN_AA = 35.0
+
+# Posibilidad de definir rangos a excluir (en REPOSO) para estimar el fondo/vecinos; en este caso no.
+EXCLUDE_FOR_BG = {
+    "Hβ": [],   # excluye [O III] 4959 y 5007
+    "Hα": [],   # excluye [N II] 6548 y 6583
+    "[O III] 4959": [],
+    "[O III] 5007": [],
+}
+
+# ============================================
+# Auxiliar: extraer "codigo_objeto" del nombre
+# ============================================
+def _extraer_codigo_objeto(stem: str) -> str:
+    """
+    Extrae el 'código' del objeto desde el stem del archivo.
+    Regla principal: tomar el último patrón '-<1-8 dígitos>_' y devolverlo sin ceros a la izquierda.
+    Ej.: 'hlsp_...-00029686_f290lp...' -> '29686'
+    Fallback: si no aparece, tomar el último bloque de 1-8 dígitos sueltos en el stem.
+    """
+    # Caso preferente: -NNNNNNNN_ (1-8 dígitos)
+    m = re.findall(r'-(\d{1,8})(?=_)', stem)
+    if m:
+        return str(int(m[-1]))  # quita ceros a la izquierda
+
+    # Fallback: último bloque de 1-8 dígitos en el nombre
+    m2 = re.findall(r'(?<!\d)(\d{1,8})(?!\d)', stem)
+    if m2:
+        return str(int(m2[-1]))
+
+    return ""  # si no hay forma de extraerlo
+
+# ======================
+# 1) Resolución R(λ_obs)
+# ======================
+def build_R_interpolator(disp_fits_path: str | Path):
+    """Crea un interpolador lineal R(λ), con λ en µm (OBSERVADO)."""
+    with fits.open(disp_fits_path) as hdul:
+        data = hdul[1].data
+        wl_um = np.array(data["WAVELENGTH"], dtype=float)  # µm, observado
+        R = np.array(data["R"], dtype=float)
+    return interp1d(wl_um, R, kind="linear", bounds_error=False, fill_value=np.nan)
+
+# ==================================
+# 2) Cosmología: d_L y su error
+# ==================================
+def luminosity_distance_with_error(z: float, h0_err: float = 0.0, om0_err: float = 0.0):
+    dl = COSMO.luminosity_distance(z).value  # Mpc
+    if h0_err <= 0.0 and om0_err <= 0.0:
+        return dl, 0.0
+    def dL(H0_, Om0_):
+        return FlatLambdaCDM(H0=H0_, Om0=Om0_).luminosity_distance(z).value
+    dl_h = 0.5 * (abs(dL(H0 + h0_err, OM0) - dl) + abs(dl - dL(H0 - h0_err, OM0))) if h0_err > 0 else 0.0
+    dl_o = 0.5 * (abs(dL(H0, OM0 + om0_err) - dl) + abs(dl - dL(H0, OM0 - om0_err))) if om0_err > 0 else 0.0
+    return dl, np.sqrt(dl_h**2 + dl_o**2)
+
+# =======================================================
+# 3) Unidades: detección y conversión Jansky -> cgs / Å
+# =======================================================
+def _get_column_unit(hdu, colname: str) -> str | None:
+    try:
+        unit = hdu.columns[colname].unit
+        if unit:
+            return str(unit)
+    except Exception:
+        pass
+    # Fallback: buscar TUNITn correspondiente
+    try:
+        for i, c in enumerate(hdu.columns, start=1):
+            if c.name.upper() == colname.upper():
+                return hdu.header.get(f"TUNIT{i}", None)
+    except Exception:
+        pass
+    return None
+
+def _jansky_scale_from_unit(unit_str: str | None) -> float | None:
+    """
+    Devuelve factor multiplicativo para convertir a Jy:
+    - 'Jy' -> 1
+    - 'mJy' -> 1e-3
+    - 'µJy' o 'uJy' -> 1e-6
+    - 'nJy' -> 1e-9
+    Si no parece Jansky, devuelve None.
+    """
+    if not unit_str:
+        return None
+    u = unit_str.strip().lower().replace(" ", "")
+    # Buscar prefijo y 'jy'/'jansky'
+    m = re.search(r"^(?P<prefix>[numµu]?)(?:jy|jansky)$", u)
+    if not m:
+        # también soportar casos tipo 'jy/beam' (se ignora el /beam)
+        m = re.search(r"^(?P<prefix>[numµu]?)(?:jy|jansky)(?:/.*)?$", u)
+    if not m:
+        return None
+    prefix = m.group("prefix")
+    if prefix == "" or prefix is None:
+        return 1.0
+    if prefix == "m":
+        return 1.0e-3
+    if prefix in ("u", "µ"):
+        return 1.0e-6
+    if prefix == "n":
+        return 1.0e-9
+    return 1.0  # por defecto
+
+def _jy_to_cgs_per_AA_factor(lam_um: np.ndarray) -> np.ndarray:
+    """
+    Devuelve el factor para convertir Fν[Jy] -> Fλ[erg s^-1 cm^-2 Å^-1]
+    usando: Fλ = Fν * (c / λ^2) * (dν/dλ), con manejo de unidades.
+    Con λ en µm, se simplifica a: Fλ[erg s^-1 cm^-2 Å^-1] = Fν[Jy] * (1e-23 * c[cm/s]) / (λ[µm]^2)
+    """
+    lam_um = np.asarray(lam_um, dtype=float)
+    return JY_CGS * C_CMS / (lam_um ** 2)
+
+def convert_flux_to_cgs_AA(lam_um: np.ndarray,
+                           flux: np.ndarray,
+                           flux_unit: str | None) -> tuple[np.ndarray, bool]:
+    """
+    Convierte el vector de flujo a erg s^-1 cm^-2 Å^-1 si está en Jansky.
+    Devuelve (flux_cgs_AA, converted_bool).
+    """
+    scale_to_jy = _jansky_scale_from_unit(flux_unit)
+    if scale_to_jy is None:
+        # Asumimos ya en erg s^-1 cm^-2 Å^-1
+        return np.asarray(flux, dtype=float), False
+    factor = _jy_to_cgs_per_AA_factor(lam_um) * scale_to_jy
+    return np.asarray(flux, dtype=float) * factor, True
+
+# ====================================================
+# 4) Cero robusto compartido y utilidades para el SNR
+# ====================================================
+def half_window_AA_by_vel(lam_obs_AA: float, vel_half_window_kms: float = VEL_HALF_WINDOW_KMS) -> float:
+    """Media-ventana de ajuste en Å (observado) a partir de Δv_half en km/s."""
+    return float(lam_obs_AA) * (vel_half_window_kms / C_KMS)
+
+def compute_shared_zero_reference_fixed(lam_obs_AA, flux_AAp, z: float,
+                                        half_window_AA: float | None = FIT_WINDOW_AA,
+                                        bg_margin: float = BG_MARGIN_AA,
+                                        vel_half_window_kms: float = VEL_HALF_WINDOW_KMS) -> tuple[float, float]:
+    """
+    Estima un cero global compartido y sigma_fondo_global, excluyendo ventanas alrededor de:
+    - TODAS las líneas principales (Hβ, [O III] 4959/5007, Hα) con media-ventana dinámica
+    - Vecinos relevantes si definidos anteriormente.
+    """
+    mask = np.isfinite(lam_obs_AA) & np.isfinite(flux_AAp)
+    x = lam_obs_AA[mask]
+    y = flux_AAp[mask]
+    if x.size < 10:
+        return 0.0, np.nan
+
+    excl = np.zeros_like(x, dtype=bool)
+
+    # Excluir alrededor de cada línea principal: media-ventana dinámica + margin
+    for rest_center in LINES.values():
+        center_obs = rest_center * (1.0 + z)
+        hw = half_window_AA_by_vel(center_obs, vel_half_window_kms) if (half_window_AA is None) else float(half_window_AA)
+        lo = center_obs - (hw + bg_margin)
+        hi = center_obs + (hw + bg_margin)
+        excl |= (x >= lo) & (x <= hi)
+
+    # Añadir eventuales exclusiones de vecinos
+    for center_rest, hw_rest in EXCLUDE_FOR_BG.get("Hα", []):
+        center_obs = center_rest * (1.0 + z)
+        hw_obs = hw_rest * (1.0 + z)                     
+        lo = center_obs - (hw_obs + bg_margin)
+        hi = center_obs + (hw_obs + bg_margin)
+        excl |= (x >= lo) & (x <= hi)
+
+    for center_rest, hw_rest in EXCLUDE_FOR_BG.get("Hβ", []):
+        center_obs = center_rest * (1.0 + z)
+        hw_obs = hw_rest * (1.0 + z)                     
+        lo = center_obs - (hw_obs + bg_margin)
+        hi = center_obs + (hw_obs + bg_margin)
+        excl |= (x >= lo) & (x <= hi)
+
+    y_bg = y[~excl]
+    if y_bg.size < 20:
+        med = float(np.nanmedian(y))
+        mad = float(np.nanmedian(np.abs(y - med)))
+    else:
+        med = float(np.nanmedian(y_bg))
+        mad = float(np.nanmedian(np.abs(y_bg - med)))
+    std = 1.4826 * mad if np.isfinite(mad) else float(np.nan)
+    return med, std
+
+
+def estimate_background_robust(x_obs_AA, y, center_obs_AA, half_window_AA,
+                               bg_margin=BG_MARGIN_AA, exclude_obs_ranges=None):
+    """Fondo robusto (mediana + MAD) en bandas laterales de la ventana (solo para SNR)."""
+    left_mask  = (x_obs_AA > center_obs_AA - half_window_AA - bg_margin) & (x_obs_AA < center_obs_AA - half_window_AA)
+    right_mask = (x_obs_AA > center_obs_AA + half_window_AA) & (x_obs_AA < center_obs_AA + half_window_AA + bg_margin)
+    if exclude_obs_ranges:
+        for lo, hi in exclude_obs_ranges:
+            left_mask  &= ~((x_obs_AA >= lo) & (x_obs_AA <= hi))
+            right_mask &= ~((x_obs_AA >= lo) & (x_obs_AA <= hi))
+    y_left  = y[left_mask]
+    y_right = y[right_mask]
+    if y_left.size == 0 and y_right.size == 0:
+        return 0.0, np.nan
+    y_bg = y_right if y_left.size == 0 else (y_left if y_right.size == 0 else np.concatenate([y_left, y_right]))
+    med = float(np.nanmedian(y_bg))
+    mad = float(np.nanmedian(np.abs(y_bg - med)))
+    std = 1.4826 * mad if np.isfinite(mad) else np.nan
+    return med, std
+
+def ratio_with_error(n, en, d, ed):
+    if np.isfinite(n) and np.isfinite(d) and (d > 0):
+        r = n / d
+        r_err = r * np.sqrt((en / n)**2 + (ed / d)**2) if (np.isfinite(en) and np.isfinite(ed) and n > 0) else np.nan
+        return r, r_err
+    return np.nan, np.nan
+
+# ==========================================
+# 5) Ajuste gaussiano
+# ==========================================
+def fit_gaussian_line_observed(lam_obs_AA, flux_zeroed_AAp, z, rest_center_AA, label,
+                               R_interp, half_window_AA: float | None = FIT_WINDOW_AA, err_AAp=None,
+                               vel_half_window_kms: float = VEL_HALF_WINDOW_KMS):
+    """
+    Ajuste Gauss + continuo CONSTANTE en λ OBSERVADA alrededor de λ0*(1+z).
+
+    - Ventana dinámica: media-ventana = λ_obs * (Δv_half / c), con Δv_half en km/s.
+      (Si se pasa half_window_AA explícito, se usa ese valor en lugar del dinámico.)
+    - Pesos con 1/ERR si err_AAp no es None.
+    - σ_min ≈ 0.8*σ_inst (desde R en λ central).
+    - Continuo fijo a 0 (todas las líneas comparten el mismo cero de flujo).
+    - Se EXCLUYEN líneas vecinas eventualmente indicadas en EXCLUDE_FOR_BG[] 
+    """
+    center_obs = rest_center_AA * (1.0 + z)
+
+    # Media-ventana de ajuste (Å, observado): dinámica por defecto
+    halfwd = half_window_AA_by_vel(center_obs, vel_half_window_kms) if (half_window_AA is None) else float(half_window_AA)
+
+    # Máscara de ventana dinámica
+    mask = (lam_obs_AA > center_obs - halfwd) & (lam_obs_AA < center_obs + halfwd)
+
+    # Excluir vecinos DURANTE EL AJUSTE
+    exclude_obs = []
+    for lam_rest, hw_rest in EXCLUDE_FOR_BG.get(label, []):
+        lam_obs_ex = lam_rest * (1.0 + z)
+        hw_obs = hw_rest * (1.0 + z)             
+        lo, hi = lam_obs_ex - hw_obs, lam_obs_ex + hw_obs
+        exclude_obs.append((lo, hi))
+        mask &= ~((lam_obs_AA > lo) & (lam_obs_AA < hi))
+
+    x = lam_obs_AA[mask]
+    y = flux_zeroed_AAp[mask]
+    if err_AAp is not None:
+        w = 1.0 / np.clip(err_AAp[mask], 1e-30, np.inf)
+    else:
+        w = None
+
+    good = np.isfinite(x) & np.isfinite(y)
+    if w is not None:
+        good &= np.isfinite(w)
+    x, y = x[good], y[good]
+    w = (w[good] if w is not None else None)
+    if x.size < 5:
+        return {"ajuste_exitoso": False, "motivo": "pocos puntos", "window_AA": halfwd}
+
+    # Fondo lateral para SNR
+    _, bg_std_side = estimate_background_robust(
+        lam_obs_AA, flux_zeroed_AAp, center_obs, halfwd,
+        bg_margin=BG_MARGIN_AA, exclude_obs_ranges=exclude_obs
+    )
+
+    # Cota inferior de σ desde R
+    R_here = float(R_interp(center_obs / AA_PER_UM)) if R_interp is not None else np.nan
+    if np.isfinite(R_here) and R_here > 0:
+        fwhm_inst_AA = center_obs / R_here
+        sigma_inst_AA = fwhm_inst_AA / GAUSS_2SQRT2LN2
+        sigma_min = 0.8 * sigma_inst_AA
+    else:
+        sigma_min = 0.0
+
+    # Modelo: Gauss + continuo constante fijo a 0
+    baseline = 0.0
+    amp0 = max(np.nanmax(y) - baseline, 0.0)
+
+    g = models.Gaussian1D(amplitude=amp0, mean=center_obs, stddev=max(2.0, sigma_min))
+    g.stddev.bounds = (sigma_min, None)
+
+    c = models.Linear1D(slope=0.0, intercept=0.0)
+    c.slope.fixed = True
+    c.intercept.fixed = True
+
+    model = g + c
+    fitter = fitting.LevMarLSQFitter()
+    try:
+        fit = fitter(model, x, y, weights=w)
+    except Exception as e:
+        return {"ajuste_exitoso": False, "motivo": f"error ajuste: {e}", "window_AA": halfwd}
+
+    # Parámetros
+    amp = float(fit[0].amplitude.value)
+    mean_obs = float(fit[0].mean.value)
+    sigma_obs_AA = float(fit[0].stddev.value)
+    fwhm_obs_AA = GAUSS_2SQRT2LN2 * sigma_obs_AA
+    slope = float(fit[1].slope.value)
+    intercept = float(fit[1].intercept.value)  # = 0.0
+
+    # Área de la gaussiana (sobre el continuo)
+    area = amp * sigma_obs_AA * np.sqrt(2.0 * np.pi)
+
+    # Errores (covarianza)
+    cov = fitter.fit_info.get("param_cov", None)
+    err_amp = err_mean_obs = err_sigma_obs_AA = err_fwhm_obs_AA = err_area = np.nan
+    if cov is not None and getattr(cov, "shape", (0, 0))[0] >= 3:
+        try:
+            err_amp = float(np.sqrt(cov[0, 0]))
+            err_mean_obs = float(np.sqrt(cov[1, 1]))
+            err_sigma_obs_AA = float(np.sqrt(cov[2, 2]))
+            err_fwhm_obs_AA = GAUSS_2SQRT2LN2 * err_sigma_obs_AA
+            err_area = area * np.sqrt(
+                (err_amp / max(amp, 1e-30))**2 + (err_sigma_obs_AA / max(sigma_obs_AA, 1e-30))**2
+            )
+        except Exception:
+            pass
+
+    # σ_obs (km/s) y su error
+    sigma_obs_kms = (fwhm_obs_AA / mean_obs) * C_KMS / GAUSS_2SQRT2LN2 if (mean_obs > 0) else np.nan
+    if np.isfinite(sigma_obs_kms) and np.isfinite(err_fwhm_obs_AA) and np.isfinite(err_mean_obs) and (fwhm_obs_AA > 0):
+        frac = np.sqrt((err_fwhm_obs_AA / fwhm_obs_AA)**2 + (err_mean_obs / mean_obs)**2)
+        sigma_obs_kms_err = sigma_obs_kms * frac
+    else:
+        sigma_obs_kms_err = np.nan
+
+    # Para el gráfico (reposo)
+    mean_rest = mean_obs / (1.0 + z)
+    fwhm_rest_AA = fwhm_obs_AA / (1.0 + z)
+    err_mean_rest = err_mean_obs / (1.0 + z) if np.isfinite(err_mean_obs) else np.nan
+    err_fwhm_rest_AA = err_fwhm_obs_AA / (1.0 + z) if np.isfinite(err_fwhm_obs_AA) else np.nan
+
+    # SNR pico ~ amplitud / ruido lateral (MAD)
+    snr_pico = float(amp / bg_std_side) if (np.isfinite(bg_std_side) and bg_std_side > 0) else np.nan
+
+    # Curva ajustada (para pintar)
+    xx = x
+    yy = fit(xx)
+
+    return {
+        "ajuste_exitoso": True,
+        "window_AA": halfwd,
+        "mean_obs_AA": mean_obs,
+        "err_mean_obs_AA": err_mean_obs,
+        "fwhm_obs_AA": fwhm_obs_AA,
+        "err_fwhm_obs_AA": err_fwhm_obs_AA,
+        "sigma_obs_kms": sigma_obs_kms,
+        "sigma_obs_kms_err": sigma_obs_kms_err,
+        "area_flux": area,
+        "err_area_flux": err_area,
+        "fondo_medio": intercept,               # = 0.0 (cero compartido)
+        "desvio_fondo": bg_std_side,
+        "snr_pico": snr_pico,
+        "mean_rest_AA": mean_rest,
+        "err_mean_rest_AA": err_mean_rest,
+        "fwhm_rest_AA": fwhm_rest_AA,
+        "err_fwhm_rest_AA": err_fwhm_rest_AA,
+        "model_params": (amp, mean_obs, sigma_obs_AA, slope, intercept),
+        "xfit": xx, "yfit": y, "y_model": yy
+    }
+
+# ====================================
+# 6) Procesado de un espectro (1 fila)
+# ====================================
+def process_one_spectrum_row(fits_path: str | Path,
+                             z: float,
+                             R_interp,
+                             out_dir="resultados") -> dict:
+    """Devuelve UNA FILA (dict) con resultados agregados por espectro."""
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    p = Path(fits_path)
+    name = p.stem
+
+    # Cargar espectro: λ en µm (OBS), FLUX y ERR (unidades pueden ser Jy o cgs/Å)
+    with fits.open(p) as hdul:
+        hdu = hdul[1]
+        tab = hdu.data
+        lam_um   = np.array(tab["WAVELENGTH"], dtype=float)
+        flux_raw = np.array(tab["FLUX"], dtype=float)
+
+        # Detectar unidades de FLUX y ERR/ERROR
+        flux_unit = _get_column_unit(hdu, "FLUX")
+        err_unit  = None
+        err_raw   = None
+        if "ERR" in hdu.columns.names:
+            err_raw  = np.array(tab["ERR"], dtype=float)
+            err_unit = _get_column_unit(hdu, "ERR")
+        elif "ERROR" in hdu.columns.names:
+            err_raw  = np.array(tab["ERROR"], dtype=float)
+            err_unit = _get_column_unit(hdu, "ERROR")
+
+    # Convertir FLUX (y ERR si aplica) a erg s^-1 cm^-2 Å^-1
+    flux_AAp, flux_was_jy = convert_flux_to_cgs_AA(lam_um, flux_raw, flux_unit)
+
+    err_AAp = None
+    if err_raw is not None:
+        # Si la ERR está en Jansky (o no trae unidad pero FLUX sí era Jy), convertir igual
+        scale_err = _jansky_scale_from_unit(err_unit)
+        if (scale_err is not None) or (scale_err is None and flux_was_jy):
+            factor = _jy_to_cgs_per_AA_factor(lam_um) * (scale_err if scale_err is not None else 1.0)
+            err_AAp = err_raw * factor
+        else:
+            err_AAp = err_raw.astype(float)
+
+    lam_obs_AA = lam_um * AA_PER_UM
+
+    # ===== Cero compartido global =====
+    shared_zero, shared_zero_std = compute_shared_zero_reference_fixed(
+        lam_obs_AA, flux_AAp, z, half_window_AA=FIT_WINDOW_AA, bg_margin=BG_MARGIN_AA
+    )
+    flux0_AAp = flux_AAp - shared_zero 
+    # =================================================================
+
+    # Ajustar líneas en OBSERVADO
+    fitres = {
+        lbl: fit_gaussian_line_observed(
+                lam_obs_AA, flux0_AAp, z, lam0, label=lbl,
+                R_interp=R_interp,
+                half_window_AA=FIT_WINDOW_AA,   # None => ventana dinámica
+                err_AAp=err_AAp
+        )
+        for lbl, lam0 in LINES.items()
+    }
+
+    # R(λ_obs) y sigmas instrumental; cálculo de sigma real por línea
+    for lbl in LINES.keys():
+        r = fitres[lbl]
+        if r.get("ajuste_exitoso", False):
+            lam_obs_um = r["mean_obs_AA"] / AA_PER_UM
+            R_here = float(R_interp(lam_obs_um)) if np.isfinite(lam_obs_um) else np.nan
+            sigma_inst = C_KMS / (GAUSS_2SQRT2LN2 * R_here) if (np.isfinite(R_here) and R_here > 0) else np.nan
+            s_obs, s_obs_err = r["sigma_obs_kms"], r["sigma_obs_kms_err"]
+            if np.isfinite(s_obs) and np.isfinite(sigma_inst) and (s_obs > sigma_inst):
+                X = s_obs**2 - sigma_inst**2 - sigma_term**2 - sigma_fs**2
+                s_real = np.sqrt(X)
+                s_real_err = (s_obs / s_real) * s_obs_err if (np.isfinite(s_obs_err) and s_real > 0) else np.nan
+            else:
+                s_real = np.nan; s_real_err = np.nan
+            r["R_at_line"] = R_here
+            r["sigma_inst_km_s"] = sigma_inst
+            r["sigma_real_km_s"] = s_real
+            r["sigma_real_km_s_err"] = s_real_err
+            r["log_sigma_real"] = np.log10(s_real) if (np.isfinite(s_real) and s_real > 0) else np.nan
+            r["log_sigma_real_err"] = (s_real_err / (s_real * np.log(10))) if (np.isfinite(s_real_err) and np.isfinite(s_real) and s_real > 0) else np.nan
+        else:
+            r["R_at_line"] = np.nan
+            r["sigma_inst_km_s"] = np.nan
+            r["sigma_real_km_s"] = np.nan
+            r["sigma_real_km_s_err"] = np.nan
+            r["log_sigma_real"] = np.nan
+            r["log_sigma_real_err"] = np.nan
+
+    # Flujos integrados y cocientes
+    def area_err(lbl):
+        r = fitres[lbl]
+        return (r.get("area_flux", np.nan), r.get("err_area_flux", np.nan)) if r.get("ajuste_exitoso", False) else (np.nan, np.nan)
+
+    F_Hb, e_Hb       = area_err("Hβ")
+    F_Ha, e_Ha       = area_err("Hα")
+    F_4959, e_4959   = area_err("[O III] 4959")
+    F_5007, e_5007   = area_err("[O III] 5007")
+
+    R_5007_Hb,     R_5007_Hb_err     = ratio_with_error(F_5007, e_5007, F_Hb, e_Hb)
+    R_OIII_tot_Hb, R_OIII_tot_Hb_err = ratio_with_error(F_4959 + F_5007, np.hypot(e_4959, e_5007), F_Hb, e_Hb)
+    R_5007_4959,   R_5007_4959_err   = ratio_with_error(F_5007, e_5007, F_4959, e_4959)
+    R_Ha_Hb,       R_Ha_Hb_err       = ratio_with_error(F_Ha, e_Ha, F_Hb, e_Hb)
+
+    # Distancia de luminosidad
+    dL_Mpc, dL_err_Mpc = luminosity_distance_with_error(z, H0_ERR, OM0_ERR)
+    dL_cm, dL_err_cm = dL_Mpc * CM_PER_MPC, dL_err_Mpc * CM_PER_MPC
+
+    # Extinción desde Hα/Hβ
+    if np.isfinite(R_Ha_Hb) and (R_Ha_Hb > 0):
+        ebv = (2.5 / (K_HBETA - K_HALPHA)) * np.log10(R_Ha_Hb / BALMER_TEORICO)
+        ebv_err = (2.5 / (K_HBETA - K_HALPHA)) * (1.0 / np.log(10)) * (R_Ha_Hb_err / R_Ha_Hb) if np.isfinite(R_Ha_Hb_err) and R_Ha_Hb > 0 else np.nan
+    else:
+        ebv, ebv_err = np.nan, np.nan
+    A_Hb, A_Hb_err = (K_HBETA * ebv if np.isfinite(ebv) else np.nan,
+                      K_HBETA * ebv_err if np.isfinite(ebv_err) else np.nan)
+
+    # Luminosidades (Hβ)
+    L_Hb      = 4.0 * np.pi * dL_cm**2 * F_Hb if np.isfinite(F_Hb) else np.nan
+    L_Hb_err  = L_Hb * np.sqrt((e_Hb / F_Hb)**2 + (2.0 * dL_err_cm / dL_cm)**2) if (np.isfinite(L_Hb) and np.isfinite(e_Hb) and F_Hb > 0 and dL_cm > 0) else np.nan
+
+    F_Hb_corr = F_Hb * (10 ** (0.4 * A_Hb)) if np.isfinite(F_Hb) and np.isfinite(A_Hb) else np.nan
+    if np.isfinite(F_Hb_corr):
+        termA = (e_Hb / F_Hb)**2 if (np.isfinite(e_Hb) and F_Hb > 0) else 0.0
+        termB = (0.4 * np.log(10) * A_Hb_err)**2 if np.isfinite(A_Hb_err) else 0.0
+        F_Hb_corr_err = F_Hb_corr * np.sqrt(termA + termB)
+    else:
+        F_Hb_corr_err = np.nan
+
+    L_Hb_corr     = 4.0 * np.pi * dL_cm**2 * F_Hb_corr if np.isfinite(F_Hb_corr) else np.nan
+    if np.isfinite(L_Hb_corr):
+        rel_sq = 0.0
+        if np.isfinite(F_Hb_corr_err) and F_Hb_corr > 0:
+            rel_sq += (F_Hb_corr_err / F_Hb_corr)**2
+        if dL_cm > 0 and np.isfinite(dL_err_cm):
+            rel_sq += (2.0 * dL_err_cm / dL_cm)**2
+        L_Hb_corr_err = L_Hb_corr * np.sqrt(rel_sq)
+    else:
+        L_Hb_corr_err = np.nan
+
+    logL_corr     = np.log10(L_Hb_corr) if (np.isfinite(L_Hb_corr) and L_Hb_corr > 0) else np.nan
+    logL_corr_err = (L_Hb_corr_err / (L_Hb_corr * np.log(10))) if (np.isfinite(L_Hb_corr_err) and np.isfinite(L_Hb_corr) and L_Hb_corr > 0) else np.nan
+
+    # ============ Figura en REPOSO ============
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), sharey=True, gridspec_kw=dict(width_ratios=[250, 150]))
+    rest_wl_AA = lam_obs_AA / (1.0 + z)
+    ax1.plot(rest_wl_AA, flux0_AAp, color="lightgray")
+    ax2.plot(rest_wl_AA, flux0_AAp, color="lightgray")
+
+    # Panel izquierdo: Hβ + [O III]
+    for lbl in ["Hβ", "[O III] 4959", "[O III] 5007"]:
+        r = fitres[lbl]
+        if r.get("ajuste_exitoso", False) and (4800.0 < r["mean_rest_AA"] < 5050.0):
+            col = LINE_COLORS[lbl]
+            x = r["xfit"]; y = r["yfit"]
+            xx = x
+            yy = r.get("y_model", None)
+            ax1.plot(x / (1.0 + z), y, color=col, lw=1.0, label=f"Datos {lbl}")
+            if yy is not None:
+                ax1.plot(xx / (1.0 + z), yy, "--", color=col, lw=1.2, label=f"Ajuste {lbl}")
+            ax1.axvline(r["mean_rest_AA"], linestyle=":", color=col, alpha=0.7)
+
+    ax1.set_xlim(4800, 5050)
+    ax1.set_xticks(np.arange(4800, 5051, 50))
+    ax1.set_xlabel("Longitud de onda [Å] (reposo)")
+    ax1.set_ylabel("F (erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$)")
+    if ax1.get_legend_handles_labels()[0]:
+        ax1.legend(fontsize=8, ncol=1)
+    ax1.grid(True, linewidth=0.5)
+
+    # Panel derecho: Hα
+    lbl = "Hα"
+    r = fitres[lbl]
+    if r.get("ajuste_exitoso", False) and (6500.0 < r["mean_rest_AA"] < 6650.0):
+        col = LINE_COLORS[lbl]
+        x = r["xfit"]; y = r["yfit"]
+        xx = x
+        yy = r.get("y_model", None)
+        ax2.plot(x / (1.0 + z), y, color=col, lw=1.0, label=f"Datos {lbl}")
+        if yy is not None:
+            ax2.plot(xx / (1.0 + z), yy, "--", color=col, lw=1.2, label=f"Ajuste {lbl}")
+        ax2.axvline(r["mean_rest_AA"], linestyle=":", color=col, alpha=0.7)
+
+    ax2.set_xlim(6500, 6650)
+    ax2.set_xticks(np.arange(6500, 6651, 50))
+    ax2.set_xlabel("Longitud de onda [Å] (reposo)")
+    if ax2.get_legend_handles_labels()[0]:
+        ax2.legend(fontsize=8)
+    ax2.grid(True, linewidth=0.5)
+
+    fig.suptitle(f"{name}  (z={z:.5f})")
+    fig.tight_layout()
+    figpath = Path(out_dir) / f"{name}_ajuste.png"
+    fig.savefig(figpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    # ======================================================
+
+    # === Fila única (1 por espectro) ===
+    row = {
+        "archivo": name,
+        "redshift": z,
+        "dL_Mpc": dL_Mpc, "dL_err_Mpc": dL_err_Mpc,
+        # Cocientes
+        "Ha_Hb": R_Ha_Hb, "Ha_Hb_err": R_Ha_Hb_err,
+        "OIII5007_Hb": R_5007_Hb, "OIII5007_Hb_err": R_5007_Hb_err,
+        "OIII_tot_Hb": R_OIII_tot_Hb, "OIII_tot_Hb_err": R_OIII_tot_Hb_err,
+        "OIII5007_4959": R_5007_4959, "OIII5007_4959_err": R_5007_4959_err,
+        # Extinción y luminosidades (Hβ)
+        "E(B-V)": ebv, "E(B-V)_err": ebv_err,
+        "A(Hβ)": A_Hb, "A(Hβ)_err": A_Hb_err,
+        "L_Hβ": L_Hb, "L_Hβ_err": L_Hb_err,
+        "F_Hβ_corr": F_Hb_corr, "F_Hβ_corr_err": F_Hb_corr_err,
+        "L_Hβ_corr": L_Hb_corr, "L_Hβ_corr_err": L_Hb_corr_err,
+        "logL_Hβ_corr": logL_corr, "logL_Hβ_corr_err": logL_corr_err,
+        "plot_path": str(figpath)
+    }
+
+    # Añadir por-línea
+    suffix_map = {
+        "Hβ": "Hbeta",
+        "[O III] 4959": "OIII4959",
+        "[O III] 5007": "OIII5007",
+        "Hα": "Halpha"
+    }
+    for lbl, suf in suffix_map.items():
+        r = fitres[lbl]
+        row[f"{suf}_lambda_obs_AA"]      = r.get("mean_obs_AA", np.nan)
+        row[f"{suf}_lambda_obs_err_AA"]  = r.get("err_mean_obs_AA", np.nan)
+        row[f"{suf}_lambda_rest_AA"]     = r.get("mean_rest_AA", np.nan)
+        row[f"{suf}_lambda_rest_err_AA"] = r.get("err_mean_rest_AA", np.nan)
+        row[f"{suf}_FWHM_obs_AA"]        = r.get("fwhm_obs_AA", np.nan)
+        row[f"{suf}_FWHM_obs_err_AA"]    = r.get("err_fwhm_obs_AA", np.nan)
+        row[f"{suf}_FWHM_rest_AA"]       = r.get("fwhm_rest_AA", np.nan)
+        row[f"{suf}_FWHM_rest_err_AA"]   = r.get("err_fwhm_rest_AA", np.nan)
+        row[f"{suf}_flux_integrado"]     = r.get("area_flux", np.nan)
+        row[f"{suf}_flux_integrado_err"] = r.get("err_area_flux", np.nan)
+        row[f"{suf}_SNR_pico"]           = r.get("snr_pico", np.nan)
+        row[f"{suf}_fondo_medio"]        = r.get("fondo_medio", np.nan)
+        row[f"{suf}_ruido_fondo"]        = r.get("desvio_fondo", np.nan)
+        if lbl == "Hβ":
+            row[f"{suf}_R_interpolado"]        = r.get("R_at_line", np.nan)
+            row[f"{suf}_sigma_obs_km_s"]       = r.get("sigma_obs_kms", np.nan)
+            row[f"{suf}_sigma_obs_km_s_err"]   = r.get("sigma_obs_kms_err", np.nan)
+            row[f"{suf}_sigma_inst_km_s"]      = r.get("sigma_inst_km_s", np.nan)
+            row[f"{suf}_sigma_real_km_s"]      = r.get("sigma_real_km_s", np.nan)
+            row[f"{suf}_sigma_real_km_s_err"]  = r.get("sigma_real_km_s_err", np.nan)
+            row[f"{suf}_log_sigma_real"]       = r.get("log_sigma_real", np.nan)
+            row[f"{suf}_log_sigma_real_err"]   = r.get("log_sigma_real_err", np.nan)
+
+    return row
+
+# =========================================
+# 7) Carga redshifts y proceso por carpeta
+# =========================================
+def load_redshifts_map(csv_path: str | Path):
+    """Lee redshifts.csv y devuelve dict filename->z."""
+    df = pd.read_csv(csv_path)
+    for col in ["filename", "archivo", "file", "fname"]:
+        if col in df.columns:
+            name_col = col
+            break
+    else:
+        raise ValueError("redshifts.csv debe tener una columna con el nombre del archivo (p.ej., 'filename').")
+    if "redshift" not in df.columns:
+        raise ValueError("redshifts.csv debe tener columna 'redshift'.")
+    m = {}
+    for _, r in df.iterrows():
+        s = str(r[name_col]); z = float(r["redshift"])
+        m[Path(s).name] = z
+        m[Path(s).stem] = z
+    return m
+
+def process_all_one_row_per_spec(
+        espectros_dir="espectros",
+        redshifts_csv="redshifts.csv",
+        disp_fits="jwst_nirspec_g395h_disp.fits",
+        excel_out="resultados/mediciones_espectros.xlsx"):
+    espectros_dir = Path(espectros_dir)
+    out_dir = Path("resultados"); out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Interpolador R(λ_obs)
+    R_interp = build_R_interpolator(disp_fits)
+    # Redshifts
+    zmap = load_redshifts_map(redshifts_csv)
+
+    rows = []
+    fits_files = sorted([p for p in espectros_dir.glob("*.fits")])
+    for p in fits_files:
+        z = zmap.get(p.name, zmap.get(p.stem, np.nan))
+        if not np.isfinite(z):
+            print(f"⚠️ {p.name}: redshift no encontrado; se omite.")
+            continue
+        # ===== Filtro de redshift =====
+        if not (Z_MIN <= float(z) <= Z_MAX):
+            continue
+        row = process_one_spectrum_row(p, float(z), R_interp, out_dir=out_dir)
+        rows.append(row)
+
+    if not rows:
+        print("No se generaron filas: puede que todas las entradas estén fuera del rango de z "
+              f"[{Z_MIN:.2f}, {Z_MAX:.2f}] o falten redshifts/rutas.")
+        return
+
+    # Excel completo
+    df_out = pd.DataFrame(rows)
+    Path(excel_out).parent.mkdir(parents=True, exist_ok=True)
+    df_out.to_excel(excel_out, index=False)
+    print(f"✅ Excel (1 fila por espectro) con {len(df_out)} filas: {excel_out}")
+
+    # ======= Tabla L–σ con filtro Ha/Hb >= 2.86 y sigma_real(Hβ) > 0 =======
+    ha_hb = pd.to_numeric(df_out.get("Ha_Hb"), errors="coerce")
+    sreal = pd.to_numeric(df_out.get("Hbeta_sigma_real_km_s"), errors="coerce")
+
+    mask = (ha_hb >= BALMER_TEORICO) & (sreal > 0)
+    df_sel = df_out[mask].copy()
+
+    rel_cols = {
+        "codigo espectro":                "archivo",
+        "Hb_lambda_observada":            "Hbeta_lambda_obs_AA",
+        "Hb_lambda_reposo":               "Hbeta_lambda_rest_AA",
+        "Hα/Hβ":                          "Ha_Hb",
+        "Hb_sigma_obs_km_s":              "Hbeta_sigma_obs_km_s",
+        "Hb_sigma_instr_km_s":            "Hbeta_sigma_inst_km_s",
+        "Hb_sigma_real_km_s":             "Hbeta_sigma_real_km_s",
+        "log(Hb_sigma_real_km_s)":        "Hbeta_log_sigma_real",
+        "log(Hb_sigma_real_km_s)_err":    "Hbeta_log_sigma_real_err",
+        "log(L_corr)":                    "logL_Hβ_corr",
+        "log(L_corr)_err":                "logL_Hβ_corr_err",
+    }
+
+    df_ls = pd.DataFrame({out: df_sel.get(inp, np.nan) for out, inp in rel_cols.items()})[list(rel_cols.keys())]
+    ls_path = Path("resultados") / "relacion L-sigma.xlsx"
+    df_ls.to_excel(ls_path, index=False)
+    print(f"✅ Tabla L–σ guardada en: {ls_path}  (filas: {len(df_ls)})")
+
+    # ======= NUEVA TABLA (ASCII) con filtros: Hα/Hβ >= 2.86 y SNR(Hβ) >= 10 =======
+        mask_habalmer = pd.to_numeric(df_out.get("Ha_Hb"), errors="coerce") >= BALMER_TEORICO
+    snr_hb = pd.to_numeric(df_out.get("Hbeta_SNR_pico"), errors="coerce")
+    mask_snr = snr_hb >= 10.0
+    df_new = df_out[mask_habalmer & mask_snr].copy()
+
+    # Columna "codigo_objeto" (solo el código, no el nombre completo del archivo)
+    df_new["codigo_objeto"] = df_new["archivo"].apply(_extraer_codigo_objeto)
+
+    # Construcción con nombres 100% ASCII
+    df_new = df_new.assign(
+        logL_Hb_corr          = df_new["logL_Hβ_corr"],
+        logL_Hb_corr_err      = df_new["logL_Hβ_corr_err"],
+        Hb_log_sigma_real     = df_new["Hbeta_log_sigma_real"],
+        Hb_log_sigma_real_err = df_new["Hbeta_log_sigma_real_err"],
+        F_Hb_corr             = df_new["F_Hβ_corr"],
+        F_Hb_corr_err         = df_new["F_Hβ_corr_err"],
+    )[[
+        "codigo_objeto",
+        "logL_Hb_corr",
+        "logL_Hb_corr_err",
+        "Hb_log_sigma_real",
+        "Hb_log_sigma_real_err",
+        "F_Hb_corr",
+        "F_Hb_corr_err",
+    ]]
+
+    # Guardado
+    new_path = Path("resultados") / "tabla_codigo_logLcorr_sigmaHb.xlsx"
+    df_new.to_excel(new_path, index=False)
+    print(f"✅ Nueva tabla (ASCII) guardada en: {new_path}  (filtrado: Hα/Hβ ≥ {BALMER_TEORICO} y SNR(Hβ) ≥ 10; filas: {len(df_new)})")
+
+# ===========================
+# 8) Ejecución por lotes
+# ===========================
+if __name__ == "__main__":
+    process_all_one_row_per_spec(
+        espectros_dir="espectros",
+        redshifts_csv="redshifts.csv",
+        disp_fits="jwst_nirspec_g395h_disp.fits",
+        excel_out="resultados/mediciones_espectros.xlsx"
+    )

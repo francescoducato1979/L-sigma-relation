@@ -1,0 +1,264 @@
+# CODIGO 4: (Herramienta de visualización)
+
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+# === Cargar tabla resumen (intenta primero en 'resultados/', luego local) ===
+df_path_1 = "resultados/mediciones_espectros.xlsx"
+df_path_2 = "mediciones_espectros.xlsx"
+if os.path.exists(df_path_1):
+    df = pd.read_excel(df_path_1)
+elif os.path.exists(df_path_2):
+    df = pd.read_excel(df_path_2)
+else:
+    raise FileNotFoundError("No se encuentra 'resultados/mediciones_espectros.xlsx' ni 'mediciones_espectros.xlsx'.")
+
+# === Widget para seleccionar cocientes y tipo de filtro ===
+cocientes = [
+    'OIII5007_Hb',
+    'OIII_tot_Hb',
+    'OIII5007_4959',
+    'Ha_Hb'
+]
+
+# Filtra por los cocientes que realmente existan en el df
+cocientes = [c for c in cocientes if c in df.columns]
+
+selector_cocientes = widgets.SelectMultiple(
+    options=cocientes,
+    value=[],
+    description='Filtrar por:',
+    layout=widgets.Layout(width='50%'),
+    style={'description_width': 'initial'}
+)
+
+modo_filtro = widgets.ToggleButtons(
+    options=[('Todos', 'todos'), ('Con valor', 'con_valor'), ('Vacíos', 'vacios')],
+    value='todos',
+    description='Mostrar:',
+    style={'description_width': 'initial'}
+)
+
+# === Crear slider y botones ===
+registro_slider = widgets.IntSlider(
+    value=0,
+    min=0,
+    max=max(len(df) - 1, 0),
+    step=1,
+    description='Registro:',
+    continuous_update=False,
+    style={'description_width': 'initial'},
+    layout=widgets.Layout(width='60%')
+)
+
+boton_anterior = widgets.Button(description='⟨ Anterior', layout=widgets.Layout(width='100px'))
+boton_siguiente = widgets.Button(description='Siguiente ⟩', layout=widgets.Layout(width='100px'))
+botones = widgets.HBox([boton_anterior, boton_siguiente])
+
+# === Área de salida ===
+contenedor_principal = widgets.Output()
+salida_tabla = widgets.Output()
+salida_grafico1 = widgets.Output()
+salida_grafico2 = widgets.Output()
+
+# === Mapeos de sufijos y utilidades ===
+suffix_map = {
+    "Hβ": "Hbeta",
+    "[O III] 4959": "OIII4959",
+    "[O III] 5007": "OIII5007",
+    "Hα": "Halpha"
+}
+
+def fmt_pm(val, err, nfmt="{:.2f}", efmt="{:.2f}"):
+    if pd.notnull(val) and pd.notnull(err):
+        try:
+            return f"{nfmt.format(val)} ± {efmt.format(err)}"
+        except Exception:
+            return f"{val} ± {err}"
+    return ""
+
+def fmt_sci_pm(val, err):
+    if pd.notnull(val) and pd.notnull(err):
+        try:
+            return f"{val:.2e} ± {err:.2e}"
+        except Exception:
+            return f"{val} ± {err}"
+    return ""
+
+def get_or_blank(row, col):
+    return row[col] if col in row and pd.notnull(row[col]) else ""
+
+# === Función para agrupar columnas con MultiIndex===
+def agrupar_columnas(df_row):
+    nuevas_filas = []
+    for _, row in df_row.iterrows():
+        nf = {}
+
+        # --- Otros ---
+        nf[('Otros', 'archivo')] = get_or_blank(row, 'archivo')
+        nf[('Otros', 'redshift')] = row['redshift'] if 'redshift' in row else ""
+
+        # --- Líneas ---
+        for etiqueta, suf in suffix_map.items():
+            # lambda obs/rest ± err
+            nf[(etiqueta, 'λ_obs [Å] ± err')]  = fmt_pm(row.get(f"{suf}_lambda_obs_AA"), row.get(f"{suf}_lambda_obs_err_AA"))
+            nf[(etiqueta, 'λ_rest [Å] ± err')] = fmt_pm(row.get(f"{suf}_lambda_rest_AA"), row.get(f"{suf}_lambda_rest_err_AA"))
+
+            # FWHM obs ± err
+            nf[(etiqueta, 'FWHM_obs [Å] ± err')] = fmt_pm(row.get(f"{suf}_FWHM_obs_AA"), row.get(f"{suf}_FWHM_obs_err_AA"))
+
+            # Flujo integrado ± err
+            nf[(etiqueta, 'Flujo (erg s⁻¹ cm⁻²) ± err')] = fmt_sci_pm(row.get(f"{suf}_flux_integrado"), row.get(f"{suf}_flux_integrado_err"))
+
+            # S/N pico
+            snr = row.get(f"{suf}_SNR_pico")
+            nf[(etiqueta, 'S/N pico')] = f"{snr:.2f}" if pd.notnull(snr) else ""
+
+            # σ y derivados (principalmente habrá para Hβ)
+            if f"{suf}_sigma_obs_km_s" in row:
+                nf[(etiqueta, 'σ_obs [km/s] ± err')] = fmt_pm(row.get(f"{suf}_sigma_obs_km_s"), row.get(f"{suf}_sigma_obs_km_s_err"))
+            if f"{suf}_sigma_inst_km_s" in row:
+                val = row.get(f"{suf}_sigma_inst_km_s")
+                nf[(etiqueta, 'σ_inst [km/s]')] = f"{val:.2f}" if pd.notnull(val) else ""
+            if f"{suf}_sigma_real_km_s" in row:
+                nf[(etiqueta, 'σ_real [km/s] ± err')] = fmt_pm(row.get(f"{suf}_sigma_real_km_s"), row.get(f"{suf}_sigma_real_km_s_err"))
+            if f"{suf}_log_sigma_real" in row:
+                nf[(etiqueta, 'log σ_real ± err')] = fmt_pm(row.get(f"{suf}_log_sigma_real"), row.get(f"{suf}_log_sigma_real_err"))
+
+        # --- Cocientes---
+        if 'OIII5007_Hb' in df.columns:
+            nf[('Cocientes', 'OIII5007_Hb')] = f"{row['OIII5007_Hb']:.2f}" if pd.notnull(row.get('OIII5007_Hb')) else ""
+        if 'OIII_tot_Hb' in df.columns:
+            nf[('Cocientes', 'OIII_tot_Hb')] = f"{row['OIII_tot_Hb']:.2f}" if pd.notnull(row.get('OIII_tot_Hb')) else ""
+        if 'OIII5007_4959' in df.columns:
+            nf[('Cocientes', 'OIII5007_4959')] = f"{row['OIII5007_4959']:.2f}" if pd.notnull(row.get('OIII5007_4959')) else ""
+        if 'Ha_Hb' in df.columns:
+            nf[('Cocientes', 'Ha_Hb')] = f"{row['Ha_Hb']:.2f}" if pd.notnull(row.get('Ha_Hb')) else ""
+
+        nuevas_filas.append(nf)
+
+    df_nuevo = pd.DataFrame(nuevas_filas)
+    df_nuevo.columns = pd.MultiIndex.from_tuples(df_nuevo.columns)
+    return df_nuevo
+
+# === Función para mostrar registro ===
+def mostrar_registro(idx):
+    salida_tabla.clear_output(wait=True)
+    salida_grafico1.clear_output(wait=True)
+    salida_grafico2.clear_output(wait=True)
+
+    filtro = modo_filtro.value
+    activos = list(selector_cocientes.value)
+
+    df_filtrado = df.copy()
+    if activos and filtro != 'todos':
+        condiciones = []
+        for campo in activos:
+            if campo not in df_filtrado.columns:
+                continue
+            if filtro == 'con_valor':
+                condiciones.append(df_filtrado[campo].notna())
+            elif filtro == 'vacios':
+                condiciones.append(df_filtrado[campo].isna())
+        if condiciones:
+            combinadas = condiciones[0]
+            for cond in condiciones[1:]:
+                combinadas &= cond
+            df_filtrado = df_filtrado[combinadas]
+
+    if len(df_filtrado) == 0 or idx >= len(df_filtrado):
+        return
+
+    fila = df_filtrado.iloc[[idx]]
+    fila_fmt = agrupar_columnas(fila.copy())
+    nombre = fila_fmt[('Otros', 'archivo')].values[0]
+
+    with salida_tabla:
+        estilos = [
+            {'selector': 'th.col_heading.level0', 'props': [('text-align', 'center'), ('border', '2px solid black'), ('background-color', '#e6e6e6')]},
+            {'selector': 'th.col_heading.level1', 'props': [('text-align', 'center'), ('border', '1px solid #999')]},
+            {'selector': 'td', 'props': [('text-align', 'center'), ('border', '1px solid #999')]},
+            {'selector': 'th.row_heading', 'props': [('border', '2px solid black'), ('text-align', 'center')]},
+            {'selector': 'th.blank', 'props': [('border', '2px solid black')]}
+        ]
+        indices_grupo = fila_fmt.columns.get_level_values(0)
+        cambios = [0] + [i for i in range(1, len(indices_grupo)) if indices_grupo[i] != indices_grupo[i - 1]]
+        for i in cambios:
+            estilos.append({'selector': f'th.col{i}', 'props': [('border-left', '2px solid black')]})
+            estilos.append({'selector': f'td.col{i}', 'props': [('border-left', '2px solid black')]})
+        ultimos_indices = [i for i in range(len(indices_grupo) - 1) if indices_grupo[i] != indices_grupo[i + 1]] + [len(indices_grupo) - 1]
+        for i in ultimos_indices:
+            estilos.append({'selector': f'th.col{i}', 'props': [('border-right', '2px solid black')]})
+            estilos.append({'selector': f'td.col{i}', 'props': [('border-right', '2px solid black')]})
+
+        display(f"\n\033[1mRegistro {idx + 1} – Archivo:\033[0m {nombre}\n")
+        display(fila_fmt.style.set_table_styles(estilos, overwrite=False))
+
+    with salida_grafico1:
+        path_ajuste = os.path.join("resultados", f"{nombre}_ajuste.png")
+        if os.path.exists(path_ajuste):
+            img = mpimg.imread(path_ajuste)
+            plt.imshow(img)
+            plt.axis('off')
+            plt.title("Espectro con ajuste")
+            plt.show()
+
+    with salida_grafico2:
+        path_rest = os.path.join("espectros_reposo", f"{nombre}_rest.png")
+        if os.path.exists(path_rest):
+            img = mpimg.imread(path_rest)
+            plt.imshow(img)
+            plt.axis('off')
+            plt.title("Espectro en reposo")
+            plt.show()
+
+# === Conectar botones ===
+def avanzar(_): registro_slider.value = min(registro_slider.value + 1, registro_slider.max)
+def retroceder(_): registro_slider.value = max(registro_slider.value - 1, registro_slider.min)
+
+boton_anterior.on_click(retroceder)
+boton_siguiente.on_click(avanzar)
+registro_slider.observe(lambda change: mostrar_registro(change['new']), names='value')
+
+def actualizar_slider(*_):
+    activos = list(selector_cocientes.value)
+    filtro = modo_filtro.value
+    df_filtrado = df.copy()
+    if activos and filtro != 'todos':
+        condiciones = []
+        for campo in activos:
+            if campo not in df_filtrado.columns:
+                continue
+            if filtro == 'con_valor':
+                condiciones.append(df_filtrado[campo].notna())
+            elif filtro == 'vacios':
+                condiciones.append(df_filtrado[campo].isna())
+        if condiciones:
+            combinadas = condiciones[0]
+            for cond in condiciones[1:]:
+                combinadas &= cond
+            df_filtrado = df_filtrado[combinadas]
+    registro_slider.max = max(len(df_filtrado) - 1, 0)
+    registro_slider.value = 0
+
+selector_cocientes.observe(actualizar_slider, names='value')
+modo_filtro.observe(actualizar_slider, names='value')
+
+# === Mostrar la app completa ===
+with contenedor_principal:
+    display(
+        widgets.VBox([
+            widgets.HBox([selector_cocientes, modo_filtro]),
+            registro_slider,
+            botones,
+            salida_tabla,
+            widgets.HBox([salida_grafico1, salida_grafico2])
+        ])
+    )
+
+display(contenedor_principal)
+mostrar_registro(0)
